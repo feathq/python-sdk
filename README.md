@@ -13,29 +13,27 @@ Python 3.10+.
 ## Usage
 
 ```python
-from feathq import FeatClient
+from feat import Client, ClientConfig, EvalContext
 
-client = FeatClient(
+client = Client(ClientConfig(
     api_key="feat_sdk_...",
     data_plane_url="https://data.feat.so",
-)
+))
 client.ready()
 
-result = client.evaluate(
-    flag_key="checkout-v2",
-    default_value=False,
-    context={
-        "targetingKey": "user-123",
-        "user": {"plan": "pro", "email": "alice@example.com"},
-    },
+ctx = EvalContext(
+    targeting_key="user-123",
+    kinds={"user": {"plan": "pro", "email": "alice@example.com"}},
 )
 
-if result.value:
+if client.get_boolean_value("checkout-v2", False, ctx):
     # ...
     pass
 
 client.close()
 ```
+
+> The PyPI distribution is `feathq-python-sdk`, but the Python module name is `feat` (so you `from feat import ...`).
 
 Use a **server** API key (`feat_sdk_...`).
 
