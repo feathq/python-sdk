@@ -1,10 +1,32 @@
 [project]
-name = "feat"
+name = "feathq-python-sdk"
 version = "0.1.0"
 description = "feat feature-flag SDK for Python (server-side, local evaluation)"
+readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
+authors = [
+  { name = "feat HQ", email = "engineering@feat.so" },
+]
+keywords = ["feature-flags", "feature-toggles", "feature-management", "feat", "openfeature"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://feat.so"
+Repository = "https://github.com/feathq/python-sdk"
+Issues = "https://github.com/feathq/python-sdk/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
