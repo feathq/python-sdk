@@ -1,5 +1,5 @@
 [project]
-name = "feathq-python-sdk"
+name = "feat-sdk"
 version = "0.1.0"
 description = "feat feature-flag SDK for Python (server-side, local evaluation)"
 readme = "README.md"

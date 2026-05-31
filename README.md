@@ -1,11 +1,11 @@
-# feathq-python-sdk
+# feat-sdk
 
 Server-side Python SDK for [feat](https://feat.so) feature flags. Local flag evaluation against a polled datafile. Zero runtime dependencies (stdlib only).
 
 ## Install
 
 ```bash
-pip install feathq-python-sdk
+pip install feat-sdk
 ```
 
 Python 3.10+.
@@ -32,8 +32,6 @@ if client.get_boolean_value("checkout-v2", False, ctx):
 
 client.close()
 ```
-
-> The PyPI distribution is `feathq-python-sdk`, but the Python module name is `feat` (so you `from feat import ...`).
 
 Use a **server** API key (`feat_sdk_...`).
 
