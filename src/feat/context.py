@@ -26,6 +26,9 @@ def resolve_attribute(ctx: EvalContext, attribute_path: str) -> Any:
     for p in rest.split("."):
         if not isinstance(cur, dict):
             return None
+        # Defensive: never traverse dunder / class-internal keys.
+        if p.startswith("__") and p.endswith("__"):
+            return None
         if p not in cur:
             return None
         cur = cur[p]

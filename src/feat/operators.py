@@ -58,11 +58,28 @@ def _ends_with(lhs: Any, values: list[Any]) -> bool:
     return any(isinstance(v, str) and lhs.endswith(v) for v in values)
 
 
+# ReDoS guard: cap pattern length and reject the most common catastrophic-
+# backtracking shapes (nested unbounded quantifiers, alternation inside a
+# starred group). False positives just turn the rule into a non-match,
+# which is the safe default.
+_REDOS_SHAPES = re.compile(r"\([^)]*[+*][^)]*\)\s*[+*]|\([^)]*\|[^)]*\)\s*[+*]")
+
+
+def _is_safe_regex(pattern: str) -> bool:
+    if len(pattern) > 512:
+        return False
+    if _REDOS_SHAPES.search(pattern):
+        return False
+    return True
+
+
 def _matches_regex(lhs: Any, values: list[Any]) -> bool:
     if not isinstance(lhs, str):
         return False
     for v in values:
         if not isinstance(v, str):
+            continue
+        if not _is_safe_regex(v):
             continue
         try:
             if re.search(v, lhs) is not None:

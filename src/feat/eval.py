@@ -53,7 +53,7 @@ def evaluate(
             value=default_value,
             variation_id=None,
             reason=Reason.ERROR,
-            error_message=f"flag '{flag_key}' not found in datafile",
+            error_message="flag could not be evaluated",
         )
 
     if flag.archived or not flag.isEnabled:
@@ -111,5 +111,5 @@ def _resolve_variation(
         value=default_value,
         variation_id=None,
         reason=Reason.ERROR,
-        error_message=f"variation '{variation_id}' missing from flag '{flag.key}'",
+        error_message="flag could not be evaluated",
     )

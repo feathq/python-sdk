@@ -1,7 +1,6 @@
 """feat feature-flag SDK for Python.
 
-Server-side evaluation against a locally-cached datafile fetched from the
-feat data plane. Wire format mirrors @feathq/datafile-schema (TypeScript).
+Server-side evaluation against a locally-cached datafile.
 """
 
 from .client import Client, ClientConfig
