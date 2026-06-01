@@ -124,6 +124,12 @@ class Client:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        # Last IP that successfully completed a connect. Tried first on
+        # the next request to skip the per-address retry loop when the
+        # resolved set contains an unreachable IP (e.g. CF anycast pop
+        # blackholed behind some NATs). Cleared on connect failure so we
+        # re-resolve.
+        self._sticky_ip: str | None = None
 
     def ready(self) -> None:
         """Blocking initial fetch + start the background poller (if enabled)."""
@@ -226,16 +232,33 @@ class Client:
         path: str,
         headers: dict[str, str],
     ) -> tuple[int, dict[str, str], bytes]:
-        """Resolve host and try each address in turn. Falls back to the
-        default resolver if getaddrinfo returns nothing."""
+        """Try the sticky IP first, then re-resolve and iterate. Falls
+        back to the default resolver if getaddrinfo returns nothing."""
+        with self._lock:
+            sticky = self._sticky_ip
+
+        if sticky:
+            try:
+                return self._do_request(host, port, scheme, path, headers, ipaddr=sticky)
+            except _RETRYABLE_CONNECT_ERRORS:
+                # Sticky IP is now unreachable - drop it and re-resolve.
+                with self._lock:
+                    if self._sticky_ip == sticky:
+                        self._sticky_ip = None
+
         addresses = self._resolve_addresses(host, port)
         if not addresses:
             return self._do_request(host, port, scheme, path, headers, ipaddr=None)
 
         last_error: BaseException | None = None
         for ip in addresses:
+            if ip == sticky:
+                continue  # already tried above
             try:
-                return self._do_request(host, port, scheme, path, headers, ipaddr=ip)
+                result = self._do_request(host, port, scheme, path, headers, ipaddr=ip)
+                with self._lock:
+                    self._sticky_ip = ip
+                return result
             except _RETRYABLE_CONNECT_ERRORS as e:
                 last_error = e
         # Re-raise the most recent connect error so callers see the real cause.
