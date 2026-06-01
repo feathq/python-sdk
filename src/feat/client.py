@@ -15,18 +15,11 @@ from .types import EvalContext
 
 MIN_POLL_INTERVAL_SECONDS = 5.0
 MAX_DATAFILE_BYTES = 10 * 1024 * 1024
-# Per-address connect budget. urllib / http.client pick one address from
-# getaddrinfo and wait the full timeout before failing - no Happy Eyeballs
-# - so worst-case for an N-address host is N times this value when every
-# IP is blackholed. Kept tight on the assumption that a healthy CDN
-# connect lands in well under a second.
 _OPEN_TIMEOUT_SECONDS = 3.0
 _READ_TIMEOUT_SECONDS = 10.0
 _RETRYABLE_CONNECT_ERRORS = (
     TimeoutError,
     ConnectionRefusedError,
-    # OSError covers socket.gaierror, socket.herror, EHOSTUNREACH,
-    # ENETUNREACH, ECONNRESET-during-handshake, etc.
     OSError,
 )
 
@@ -57,10 +50,9 @@ def _validate_https(url: str) -> None:
     )
 
 
+# Override host->IP for connect while keeping the original hostname for
+# SNI and cert verification, which the base classes don't allow.
 class _IPHTTPSConnection(http.client.HTTPSConnection):
-    """HTTPS connection that connects to a specific IP while keeping the
-    original hostname for SNI and certificate verification."""
-
     def __init__(
         self,
         host: str,
@@ -81,13 +73,10 @@ class _IPHTTPSConnection(http.client.HTTPSConnection):
         if self._tunnel_host:
             self._tunnel()
         self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
-        # Tighter timeout for connect; broader budget for the response body.
         self.sock.settimeout(self._read_timeout)
 
 
 class _IPHTTPConnection(http.client.HTTPConnection):
-    """Plain-HTTP counterpart of _IPHTTPSConnection (used for loopback)."""
-
     def __init__(
         self,
         host: str,
@@ -124,11 +113,6 @@ class Client:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
-        # Last IP that successfully completed a connect. Tried first on
-        # the next request to skip the per-address retry loop when the
-        # resolved set contains an unreachable IP (e.g. CF anycast pop
-        # blackholed behind some NATs). Cleared on connect failure so we
-        # re-resolve.
         self._sticky_ip: str | None = None
 
     def ready(self) -> None:
@@ -224,6 +208,9 @@ class Client:
                 self._etag = new_etag
         return True
 
+    # http.client doesn't iterate getaddrinfo results on connect failure,
+    # so a host with one unreachable IP wedges every request until the
+    # full timeout. Try sticky first, fall through on connect errors.
     def _request(
         self,
         host: str,
@@ -232,8 +219,6 @@ class Client:
         path: str,
         headers: dict[str, str],
     ) -> tuple[int, dict[str, str], bytes]:
-        """Try the sticky IP first, then re-resolve and iterate. Falls
-        back to the default resolver if getaddrinfo returns nothing."""
         with self._lock:
             sticky = self._sticky_ip
 
@@ -241,7 +226,6 @@ class Client:
             try:
                 return self._do_request(host, port, scheme, path, headers, ipaddr=sticky)
             except _RETRYABLE_CONNECT_ERRORS:
-                # Sticky IP is now unreachable - drop it and re-resolve.
                 with self._lock:
                     if self._sticky_ip == sticky:
                         self._sticky_ip = None
@@ -253,7 +237,7 @@ class Client:
         last_error: BaseException | None = None
         for ip in addresses:
             if ip == sticky:
-                continue  # already tried above
+                continue
             try:
                 result = self._do_request(host, port, scheme, path, headers, ipaddr=ip)
                 with self._lock:
@@ -261,8 +245,7 @@ class Client:
                 return result
             except _RETRYABLE_CONNECT_ERRORS as e:
                 last_error = e
-        # Re-raise the most recent connect error so callers see the real cause.
-        assert last_error is not None  # noqa: S101 - invariant
+        assert last_error is not None  # noqa: S101
         raise last_error
 
     @staticmethod
@@ -309,7 +292,6 @@ class Client:
             )
             if length_header and int(length_header) > MAX_DATAFILE_BYTES:
                 raise RuntimeError("datafile exceeds maximum allowed size")
-            # +1 so we can detect oversized bodies without a Content-Length header.
             body = resp.read(MAX_DATAFILE_BYTES + 1)
             return status, response_headers, body
         finally:
