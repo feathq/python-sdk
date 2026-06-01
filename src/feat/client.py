@@ -1,10 +1,11 @@
-"""Polling HTTP client. Uses stdlib only (urllib + threading) - zero deps."""
+"""Polling HTTP client. Uses stdlib only - zero deps."""
 
+import http.client
 import json
+import socket
+import ssl
 import threading
-import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +15,20 @@ from .types import EvalContext
 
 MIN_POLL_INTERVAL_SECONDS = 5.0
 MAX_DATAFILE_BYTES = 10 * 1024 * 1024
+# Per-address connect budget. urllib / http.client pick one address from
+# getaddrinfo and wait the full timeout before failing - no Happy Eyeballs
+# - so worst-case for an N-address host is N times this value when every
+# IP is blackholed. Kept tight on the assumption that a healthy CDN
+# connect lands in well under a second.
+_OPEN_TIMEOUT_SECONDS = 3.0
+_READ_TIMEOUT_SECONDS = 10.0
+_RETRYABLE_CONNECT_ERRORS = (
+    TimeoutError,
+    ConnectionRefusedError,
+    # OSError covers socket.gaierror, socket.herror, EHOSTUNREACH,
+    # ENETUNREACH, ECONNRESET-during-handshake, etc.
+    OSError,
+)
 
 
 @dataclass
@@ -40,6 +55,56 @@ def _validate_https(url: str) -> None:
     raise ValueError(
         "data_plane_url must use https:// (http://localhost allowed for tests)"
     )
+
+
+class _IPHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection that connects to a specific IP while keeping the
+    original hostname for SNI and certificate verification."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int | None = None,
+        *,
+        ipaddr: str | None = None,
+        context: ssl.SSLContext | None = None,
+        connect_timeout: float = _OPEN_TIMEOUT_SECONDS,
+        read_timeout: float = _READ_TIMEOUT_SECONDS,
+    ) -> None:
+        super().__init__(host, port=port, context=context, timeout=connect_timeout)
+        self._ipaddr = ipaddr
+        self._read_timeout = read_timeout
+
+    def connect(self) -> None:
+        target = (self._ipaddr or self.host, self.port)
+        self.sock = socket.create_connection(target, timeout=self.timeout)
+        if self._tunnel_host:
+            self._tunnel()
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
+        # Tighter timeout for connect; broader budget for the response body.
+        self.sock.settimeout(self._read_timeout)
+
+
+class _IPHTTPConnection(http.client.HTTPConnection):
+    """Plain-HTTP counterpart of _IPHTTPSConnection (used for loopback)."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int | None = None,
+        *,
+        ipaddr: str | None = None,
+        connect_timeout: float = _OPEN_TIMEOUT_SECONDS,
+        read_timeout: float = _READ_TIMEOUT_SECONDS,
+    ) -> None:
+        super().__init__(host, port=port, timeout=connect_timeout)
+        self._ipaddr = ipaddr
+        self._read_timeout = read_timeout
+
+    def connect(self) -> None:
+        target = (self._ipaddr or self.host, self.port)
+        self.sock = socket.create_connection(target, timeout=self.timeout)
+        self.sock.settimeout(self._read_timeout)
 
 
 class Client:
@@ -119,31 +184,110 @@ class Client:
         from . import __version__
 
         url = self.config.data_plane_url.rstrip("/") + "/sdk/v1/datafile"
-        req = urllib.request.Request(url)
-        req.add_header("Authorization", f"Bearer {self.config.api_key}")
-        req.add_header("User-Agent", f"feat-sdk-python/{__version__}")
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname
+        if host is None:
+            raise RuntimeError(f"data_plane_url missing host: {url}")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "User-Agent": f"feat-sdk-python/{__version__}",
+        }
         with self._lock:
             if self._etag:
-                req.add_header("If-None-Match", self._etag)
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310 - trusted endpoint
-                status = resp.status
-                if status in (304, 404):
-                    return False
-                length_header = resp.headers.get("Content-Length")
-                if length_header and int(length_header) > MAX_DATAFILE_BYTES:
-                    raise RuntimeError("datafile exceeds maximum allowed size")
-                body = resp.read(MAX_DATAFILE_BYTES + 1)
-                if len(body) > MAX_DATAFILE_BYTES:
-                    raise RuntimeError("datafile exceeds maximum allowed size")
-                data = json.loads(body.decode("utf-8"))
-                new_etag = resp.headers.get("ETag")
-        except urllib.error.HTTPError as e:
-            if e.code in (304, 404):
-                return False
-            raise
+                headers["If-None-Match"] = self._etag
+
+        status, response_headers, body = self._request(host, port, parsed.scheme, path, headers)
+
+        if status in (304, 404):
+            return False
+        if status != 200:
+            raise RuntimeError(f"feat: fetch datafile failed: {status}")
+
+        if len(body) > MAX_DATAFILE_BYTES:
+            raise RuntimeError("datafile exceeds maximum allowed size")
+        data = json.loads(body.decode("utf-8"))
+        new_etag = response_headers.get("ETag") or response_headers.get("etag")
         with self._lock:
             self._datafile = from_json(data)
             if new_etag:
                 self._etag = new_etag
         return True
+
+    def _request(
+        self,
+        host: str,
+        port: int,
+        scheme: str,
+        path: str,
+        headers: dict[str, str],
+    ) -> tuple[int, dict[str, str], bytes]:
+        """Resolve host and try each address in turn. Falls back to the
+        default resolver if getaddrinfo returns nothing."""
+        addresses = self._resolve_addresses(host, port)
+        if not addresses:
+            return self._do_request(host, port, scheme, path, headers, ipaddr=None)
+
+        last_error: BaseException | None = None
+        for ip in addresses:
+            try:
+                return self._do_request(host, port, scheme, path, headers, ipaddr=ip)
+            except _RETRYABLE_CONNECT_ERRORS as e:
+                last_error = e
+        # Re-raise the most recent connect error so callers see the real cause.
+        assert last_error is not None  # noqa: S101 - invariant
+        raise last_error
+
+    @staticmethod
+    def _resolve_addresses(host: str, port: int) -> list[str]:
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError:
+            return []
+        seen: set[str] = set()
+        out: list[str] = []
+        for info in infos:
+            ip = info[4][0]
+            if ip not in seen:
+                seen.add(ip)
+                out.append(ip)
+        return out
+
+    @staticmethod
+    def _do_request(
+        host: str,
+        port: int,
+        scheme: str,
+        path: str,
+        headers: dict[str, str],
+        *,
+        ipaddr: str | None,
+    ) -> tuple[int, dict[str, str], bytes]:
+        if scheme == "https":
+            conn: http.client.HTTPConnection = _IPHTTPSConnection(
+                host,
+                port=port,
+                ipaddr=ipaddr,
+                context=ssl.create_default_context(),
+            )
+        else:
+            conn = _IPHTTPConnection(host, port=port, ipaddr=ipaddr)
+        try:
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            status = resp.status
+            response_headers = {k: v for k, v in resp.getheaders()}
+            length_header = response_headers.get("Content-Length") or response_headers.get(
+                "content-length"
+            )
+            if length_header and int(length_header) > MAX_DATAFILE_BYTES:
+                raise RuntimeError("datafile exceeds maximum allowed size")
+            # +1 so we can detect oversized bodies without a Content-Length header.
+            body = resp.read(MAX_DATAFILE_BYTES + 1)
+            return status, response_headers, body
+        finally:
+            conn.close()
