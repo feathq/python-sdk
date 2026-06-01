@@ -121,8 +121,6 @@ class Client:
         url = self.config.data_plane_url.rstrip("/") + "/sdk/v1/datafile"
         req = urllib.request.Request(url)
         req.add_header("Authorization", f"Bearer {self.config.api_key}")
-        # Identifies SDK traffic in data-plane logs and sidesteps WAF rules
-        # that flag the stdlib default (Python-urllib/<ver>) as a bot.
         req.add_header("User-Agent", f"feat-sdk-python/{__version__}")
         with self._lock:
             if self._etag:
