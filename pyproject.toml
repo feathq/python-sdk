@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-  { name = "feat HQ", email = "engineering@feat.so" },
+  { name = "feat HQ", email = "support@feat.so" },
 ]
 keywords = ["feature-flags", "feature-toggles", "feature-management", "feat", "openfeature"]
 classifiers = [
