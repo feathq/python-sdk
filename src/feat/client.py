@@ -24,10 +24,15 @@ _RETRYABLE_CONNECT_ERRORS = (
 )
 
 
+_DEFAULT_URL = "https://data-01.feat.so"
+
+
 @dataclass
 class ClientConfig:
     api_key: str
-    data_plane_url: str
+    # Optional. Defaults to the production endpoint. Override for region
+    # pinning, staging, or local development.
+    url: str = _DEFAULT_URL
     poll_interval_seconds: float = 30.0
     # If True, start() spawns a background daemon thread that polls
     # on the configured cadence. Tests typically set this False and
@@ -40,13 +45,13 @@ def _validate_https(url: str) -> None:
     try:
         parsed = urllib.parse.urlparse(url)
     except ValueError as exc:  # pragma: no cover - urlparse rarely raises
-        raise ValueError("dataPlaneUrl is not a valid URL") from exc
+        raise ValueError("url is not a valid URL") from exc
     if parsed.scheme == "https":
         return
     if parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1"):
         return
     raise ValueError(
-        "data_plane_url must use https:// (http://localhost allowed for tests)"
+        "url must use https:// (http://localhost allowed for tests)"
     )
 
 
@@ -104,7 +109,7 @@ class Client:
     """
 
     def __init__(self, config: ClientConfig) -> None:
-        _validate_https(config.data_plane_url)
+        _validate_https(config.url)
         if config.poll_interval_seconds < MIN_POLL_INTERVAL_SECONDS:
             config.poll_interval_seconds = MIN_POLL_INTERVAL_SECONDS
         self.config = config
@@ -173,11 +178,11 @@ class Client:
     def _fetch_once(self) -> bool:
         from . import __version__
 
-        url = self.config.data_plane_url.rstrip("/") + "/sdk/v1/datafile"
+        url = self.config.url.rstrip("/") + "/sdk/v1/datafile"
         parsed = urllib.parse.urlparse(url)
         host = parsed.hostname
         if host is None:
-            raise RuntimeError(f"data_plane_url missing host: {url}")
+            raise RuntimeError(f"url missing host: {url}")
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         path = parsed.path or "/"
         if parsed.query:

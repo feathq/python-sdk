@@ -25,7 +25,7 @@ from feat import Client, ClientConfig, EvalContext
 
 client = Client(ClientConfig(
     api_key="feat_sdk_...",
-    data_plane_url="https://data.feat.so",
+    url="https://data-01.feat.so",  # optional; this is the default
 ))
 client.ready()
 
