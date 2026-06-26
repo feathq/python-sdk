@@ -46,9 +46,25 @@ Use a **server** API key (`feat_sdk_...`).
 ## How it works
 
 - Fetches a per-environment datafile and keeps it in memory.
-- Polls every 30 seconds by default (configurable). ETag-aware via `If-None-Match`.
+- Streams live updates by default over Server-Sent Events: a background thread
+  holds the connection and applies each pushed datafile the moment it changes.
+- A background poll runs alongside the stream as a safety net (every 30 seconds
+  by default, configurable; ETag-aware via `If-None-Match`). If the stream
+  drops, the poll keeps the datafile fresh while the stream reconnects with
+  exponential backoff.
+- Updates are version-ordered: a datafile is adopted only when its version is
+  strictly newer than the one in memory, so the stream and poll never clobber
+  each other.
 - Evaluation runs in-process: no per-flag network call.
-- A background daemon thread handles polling; `close()` stops it cleanly.
+- `close()` stops the stream and poll threads cleanly.
+
+### Disabling streaming
+
+Set `streaming=False` to rely on polling alone:
+
+```python
+client = Client(ClientConfig(api_key="feat_sdk_...", streaming=False))
+```
 
 ## License
 
