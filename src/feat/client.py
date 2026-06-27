@@ -298,17 +298,18 @@ class Client:
 
         Lock-guarded and version-ordered so concurrent poll + stream updates
         never replace a newer datafile with an older one. `etag` (when given,
-        i.e. from a poll response) is always recorded so conditional requests
-        stay current even when the datafile itself is not adopted. Returns
-        True if the datafile was adopted.
+        i.e. from a poll response or a pushed datafile) is recorded only when
+        the datafile is adopted, so an out-of-order or older frame cannot
+        regress the etag and provoke a stale conditional request. Returns True
+        if the datafile was adopted.
         """
         with self._lock:
             current = self._datafile
             adopt = current is None or df.version > current.version
             if adopt:
                 self._datafile = df
-            if etag:
-                self._etag = etag
+                if etag:
+                    self._etag = etag
             return adopt
 
     def _adopt_from_stream(self, data: dict[str, Any]) -> None:
@@ -318,7 +319,9 @@ class Client:
         except (KeyError, TypeError, ValueError):
             # Malformed payload: keep the current datafile.
             return
-        self._apply_datafile(df)
+        # Carry the pushed datafile's etag so the next conditional poll sends a
+        # current If-None-Match and gets a 304 instead of a full re-download.
+        self._apply_datafile(df, etag=df.etag)
 
     # http.client doesn't iterate getaddrinfo results on connect failure,
     # so a host with one unreachable IP wedges every request until the

@@ -99,6 +99,32 @@ class StubTransport:
         return self._streams.pop(0)
 
 
+class RecordingStop:
+    """A stop signal whose wait() records the timeout and never blocks.
+
+    Lets a test drive the reconnect loop synchronously and inspect the backoff
+    schedule. After `stop_after` waits it signals stop so run() returns.
+    """
+
+    def __init__(self, stop_after: int) -> None:
+        self._stop_after = stop_after
+        self.waits: list[float] = []
+        self._set = False
+
+    def is_set(self) -> bool:
+        return self._set
+
+    def set(self) -> None:
+        self._set = True
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.waits.append(timeout if timeout is not None else 0.0)
+        if len(self.waits) >= self._stop_after:
+            self._set = True
+            return True
+        return False
+
+
 def user_ctx(key: str) -> EvalContext:
     return EvalContext(kinds={"user": {"key": key}})
 
@@ -322,6 +348,165 @@ def test_close_shuts_down_stream_thread_promptly():
     assert not client._stream_thread.is_alive()
     assert stream.closed is True
     assert elapsed < 1.5  # closed promptly, not after a long read timeout
+
+
+# --- streaming disabled ----------------------------------------------------
+
+
+def test_streaming_disabled_starts_poll_only():
+    # streaming=False must not open a stream, but the poll thread still runs.
+    transport = StubTransport([StubStream([])])
+    client = make_client(transport, streaming=False, poll_in_background=True)
+    client._fetch_once = lambda: False  # type: ignore[method-assign]
+    client.ready()
+    try:
+        assert client._thread is not None and client._thread.is_alive()
+        assert client._stream_thread is None
+        assert client._stream_worker is None
+        assert transport.calls == []  # transport never invoked
+    finally:
+        client.close()
+        client._thread.join(timeout=2.0)
+
+    assert not client._thread.is_alive()
+
+
+# --- backoff ----------------------------------------------------------------
+
+
+def test_backoff_grows_when_server_accepts_then_closes_immediately():
+    # 200 then immediate EOF after seeding is NOT productive: backoff must keep
+    # growing (capped) and never reset to the initial value, so a flapping
+    # server is not reconnected to every ~initial-backoff seconds.
+    transport = StubTransport([StubStream([], status=200) for _ in range(8)])
+    stop = RecordingStop(stop_after=6)
+    worker = StreamWorker(
+        transport=transport,
+        url="https://localhost/sdk/v1/datafile/stream",
+        headers={},
+        on_datafile=lambda _d: None,
+        stop_event=stop,  # type: ignore[arg-type]
+        initial_backoff_seconds=1.0,
+        max_backoff_seconds=8.0,
+        backoff_jitter=0.25,
+        min_uptime_seconds=30.0,
+    )
+    worker.run()
+
+    # Bases double each round and then hold at the cap; jitter stays within
+    # [base, base * (1 + jitter)].
+    expected_bases = [1.0, 2.0, 4.0, 8.0, 8.0, 8.0]
+    assert len(worker_waits := stop.waits) == len(expected_bases)
+    for wait, base in zip(worker_waits, expected_bases):
+        assert base <= wait <= base * 1.25
+    assert max(worker_waits) <= 8.0 * 1.25  # cap holds
+
+
+# --- non-200 ----------------------------------------------------------------
+
+
+def test_persistent_non_200_backs_off_without_busy_looping():
+    # 401/403/429 adopt nothing, never set `connected`, and back off each round
+    # instead of tight-looping at a fixed tiny wait.
+    transport = StubTransport(
+        [StubStream(put_frame(2), status=code) for code in (401, 403, 429, 401)]
+    )
+    client = make_client(transport)
+    client._apply_datafile(_from(datafile_json(1)))
+    stop = RecordingStop(stop_after=4)
+    worker = StreamWorker(
+        transport=transport,
+        url="https://localhost/sdk/v1/datafile/stream",
+        headers={},
+        on_datafile=client._adopt_from_stream,
+        stop_event=stop,  # type: ignore[arg-type]
+        initial_backoff_seconds=1.0,
+        max_backoff_seconds=8.0,
+        backoff_jitter=0.0,
+    )
+    worker.run()
+
+    assert client._datafile.version == 1  # nothing adopted
+    assert worker.connected.is_set() is False
+    assert stop.waits == [1.0, 2.0, 4.0, 8.0]  # grew, did not tight-loop
+
+
+# --- payload handling -------------------------------------------------------
+
+
+def test_non_dict_json_payload_is_dropped():
+    # `data: 5` parses as valid JSON but is not a datafile dict; drop it.
+    transport = StubTransport([StubStream(["event: put", "data: 5", ""])])
+    client = make_client(transport)
+    client._apply_datafile(_from(datafile_json(1)))
+
+    _worker(client, transport)._stream_once()  # must not raise
+
+    assert client._datafile.version == 1
+
+
+# --- heartbeat interleaving -------------------------------------------------
+
+
+def test_heartbeat_interleaved_with_put_adopts_once():
+    payload = json.dumps(datafile_json(2, default_variation_id=TRUE_VAR["id"]))
+    lines = [
+        ": ping",
+        "event: put",
+        "id: 2",
+        f"data: {payload}",
+        "",
+        ": ping",
+    ]
+    transport = StubTransport([StubStream(lines)])
+    client = make_client(transport)
+    client._apply_datafile(_from(datafile_json(1)))
+
+    adopted: list[int] = []
+    original = client._apply_datafile
+
+    def spy(df, etag=None):
+        result = original(df, etag=etag)
+        if result:
+            adopted.append(df.version)
+        return result
+
+    client._apply_datafile = spy  # type: ignore[method-assign]
+
+    _worker(client, transport)._stream_once()
+
+    assert client._datafile.version == 2
+    assert adopted == [2]  # exactly one adoption despite the heartbeats
+
+
+# --- etag propagation -------------------------------------------------------
+
+
+def test_stream_etag_used_by_subsequent_poll_gets_304():
+    # A stream-adopted datafile records its etag so the next conditional poll
+    # sends a current If-None-Match and gets a 304 rather than a full 200.
+    transport = StubTransport(
+        [StubStream(put_frame(2, default_variation_id=TRUE_VAR["id"]))]
+    )
+    client = make_client(transport)
+    client._apply_datafile(_from(datafile_json(1)), etag="etag-1")
+
+    _worker(client, transport)._stream_once()
+    assert client._datafile.version == 2
+    assert client._etag == "etag-2"  # adopted from the pushed datafile
+
+    captured: dict[str, str] = {}
+
+    def fake_request(host, port, scheme, path, headers):
+        captured.update(headers)
+        return 304, {}, b""
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    changed = client.refresh()
+
+    assert changed is False
+    assert captured.get("If-None-Match") == "etag-2"
 
 
 # --- helpers ---------------------------------------------------------------

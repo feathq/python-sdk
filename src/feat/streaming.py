@@ -1,6 +1,6 @@
 """Live datafile streaming over Server-Sent Events (SSE).
 
-The data plane exposes ``GET {url}/sdk/v1/datafile/stream`` which returns a
+The server exposes ``GET {url}/sdk/v1/datafile/stream`` which returns a
 ``text/event-stream``. On connect, and on every datafile change, the server
 pushes a frame::
 
@@ -17,17 +17,26 @@ stream and returns an :class:`SSEStream`. The default transport (stdlib
 """
 
 import json
+import logging
 import random
 import threading
+import time
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, Callable, Protocol
+
+logger = logging.getLogger(__name__)
 
 # Reconnect backoff bounds (seconds). Each failed/closed connection waits a
 # little longer, up to the cap, with jitter to avoid a thundering herd.
 _INITIAL_BACKOFF_SECONDS = 1.0
 _MAX_BACKOFF_SECONDS = 30.0
 _BACKOFF_JITTER = 0.25
+# A connection only counts as "productive" (worth resetting backoff for) once
+# it has stayed up this long. A server that accepts the connection and then
+# closes immediately after seeding is not productive, so backoff keeps growing
+# instead of hammering a flapping server every initial-backoff seconds.
+_MIN_UPTIME_SECONDS = 30.0
 
 
 @dataclass
@@ -123,6 +132,7 @@ class StreamWorker:
         initial_backoff_seconds: float = _INITIAL_BACKOFF_SECONDS,
         max_backoff_seconds: float = _MAX_BACKOFF_SECONDS,
         backoff_jitter: float = _BACKOFF_JITTER,
+        min_uptime_seconds: float = _MIN_UPTIME_SECONDS,
     ) -> None:
         self._transport = transport
         self._url = url
@@ -132,6 +142,7 @@ class StreamWorker:
         self._initial_backoff = initial_backoff_seconds
         self._max_backoff = max_backoff_seconds
         self._jitter = backoff_jitter
+        self._min_uptime = min_uptime_seconds
         self._stream_lock = threading.Lock()
         self._stream: SSEStream | None = None
         # Set once a stream reaches status 200; useful as a test signal.
@@ -141,15 +152,27 @@ class StreamWorker:
         """Reconnect loop. Returns when ``stop_event`` is set."""
         backoff = self._initial_backoff
         while not self._stop.is_set():
-            connected = False
+            productive = False
             try:
-                connected = self._stream_once()
+                productive = self._stream_once()
             except Exception:  # noqa: BLE001 - defensive: any failure -> reconnect
-                connected = False
+                logger.debug(
+                    "feat: datafile stream connection failed; reconnecting",
+                    exc_info=True,
+                )
+                productive = False
             if self._stop.is_set():
                 break
-            if connected:
+            # Only a productive connection (stayed up past the minimum uptime or
+            # delivered more than the initial seed) resets backoff. A server
+            # that accepts then immediately closes keeps backoff growing.
+            if productive:
                 backoff = self._initial_backoff
+            else:
+                logger.debug(
+                    "feat: datafile stream closed; reconnecting in up to %.1fs",
+                    backoff,
+                )
             wait = backoff + random.uniform(0.0, backoff * self._jitter)
             if self._stop.wait(wait):
                 break
@@ -171,8 +194,11 @@ class StreamWorker:
     def _stream_once(self) -> bool:
         """Open one connection and pump events until it closes.
 
-        Returns True if a stream was established (status 200), regardless of
-        how many events arrived, so the loop can reset its backoff.
+        Returns True only if the connection was *productive*: it stayed up past
+        the minimum uptime or delivered more than the initial seed frame. A
+        connection that returns 200 then closes immediately after seeding is
+        not productive, so the caller keeps growing its backoff rather than
+        reconnecting to a flapping server every initial-backoff seconds.
         """
         stream = self._transport(self._url, self._headers)
         with self._stream_lock:
@@ -182,14 +208,23 @@ class StreamWorker:
             self._stream = stream
         try:
             if stream.status != 200:
+                logger.warning(
+                    "feat: datafile stream returned status %s; reconnecting",
+                    stream.status,
+                )
                 return False
             self.connected.set()
+            connected_at = time.monotonic()
+            puts = 0
             for event in parse_sse(stream.iter_lines()):
                 if self._stop.is_set():
                     break
                 if event.event == "put":
+                    puts += 1
                     self._handle_put(event)
-            return True
+            uptime = time.monotonic() - connected_at
+            # More than one put means a real change arrived beyond the seed.
+            return uptime >= self._min_uptime or puts > 1
         finally:
             with self._stream_lock:
                 self._stream = None
