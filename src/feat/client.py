@@ -1,4 +1,4 @@
-"""Polling HTTP client. Uses stdlib only - zero deps."""
+"""Polling + streaming HTTP client. Uses stdlib only - zero deps."""
 
 import http.client
 import json
@@ -6,17 +6,24 @@ import socket
 import ssl
 import threading
 import urllib.parse
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from .datafile import Datafile, from_json
 from .eval import EvaluationResult, Reason, evaluate
+from .streaming import SSEStream, SSETransport, StreamWorker
 from .types import EvalContext
 
 MIN_POLL_INTERVAL_SECONDS = 5.0
 MAX_DATAFILE_BYTES = 10 * 1024 * 1024
 _OPEN_TIMEOUT_SECONDS = 3.0
 _READ_TIMEOUT_SECONDS = 10.0
+# Streaming connections are long-lived: the read timeout only needs to exceed
+# the server's heartbeat interval so a wedged socket eventually errors out and
+# triggers a reconnect.
+_STREAM_READ_TIMEOUT_SECONDS = 90.0
+_DEFAULT_STREAM_PATH = "/sdk/v1/datafile/stream"
 _RETRYABLE_CONNECT_ERRORS = (
     TimeoutError,
     ConnectionRefusedError,
@@ -35,9 +42,16 @@ class ClientConfig:
     url: str = _DEFAULT_URL
     poll_interval_seconds: float = 30.0
     # If True, start() spawns a background daemon thread that polls
-    # on the configured cadence. Tests typically set this False and
-    # drive refresh() manually.
+    # on the configured cadence. When streaming is enabled this poll is
+    # the safety net behind the live stream. Tests typically set this
+    # False and drive refresh() manually.
     poll_in_background: bool = True
+    # If True (default), ready() also opens a live SSE stream that pushes
+    # datafile updates as they happen; the background poll keeps running as
+    # a fallback. Set False to rely on polling alone.
+    streaming: bool = True
+    # Path of the SSE endpoint, joined onto `url`.
+    stream_path: str = _DEFAULT_STREAM_PATH
 
 
 def _validate_https(url: str) -> None:
@@ -101,6 +115,35 @@ class _IPHTTPConnection(http.client.HTTPConnection):
         self.sock.settimeout(self._read_timeout)
 
 
+_MAX_SSE_LINE_BYTES = MAX_DATAFILE_BYTES + 1
+
+
+class _HttpClientSSEStream:
+    """Wraps an http.client streaming response as an SSEStream.
+
+    Reads the body line by line without buffering the whole (never-ending)
+    response. Each readline is capped so a hostile peer cannot exhaust memory.
+    """
+
+    def __init__(self, conn: http.client.HTTPConnection, resp: http.client.HTTPResponse) -> None:
+        self._conn = conn
+        self._resp = resp
+        self.status: int = resp.status
+
+    def iter_lines(self) -> Iterator[str]:
+        while True:
+            raw = self._resp.readline(_MAX_SSE_LINE_BYTES)
+            if not raw:
+                return
+            yield raw.decode("utf-8", "replace")
+
+    def close(self) -> None:
+        try:
+            self._resp.close()
+        finally:
+            self._conn.close()
+
+
 class Client:
     """In-memory datafile cache with background polling.
 
@@ -108,7 +151,12 @@ class Client:
     evaluate(). Thread-safe: the datafile pointer is swapped atomically.
     """
 
-    def __init__(self, config: ClientConfig) -> None:
+    def __init__(
+        self,
+        config: ClientConfig,
+        *,
+        stream_transport: SSETransport | None = None,
+    ) -> None:
         _validate_https(config.url)
         if config.poll_interval_seconds < MIN_POLL_INTERVAL_SECONDS:
             config.poll_interval_seconds = MIN_POLL_INTERVAL_SECONDS
@@ -119,16 +167,52 @@ class Client:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._sticky_ip: str | None = None
+        # Transport for the SSE stream. Injectable for tests; defaults to the
+        # stdlib http.client implementation below.
+        self._stream_transport: SSETransport = stream_transport or self._open_sse_stream
+        self._stream_worker: StreamWorker | None = None
+        self._stream_thread: threading.Thread | None = None
 
     def ready(self) -> None:
-        """Blocking initial fetch + start the background poller (if enabled)."""
+        """Blocking initial fetch, then start the background workers.
+
+        With the default config this opens a live SSE stream and a fallback
+        poll loop. The stream applies updates as they happen; the poll is the
+        safety net if the stream drops.
+        """
         self._fetch_once()
         if self.config.poll_in_background and self._thread is None:
             self._thread = threading.Thread(target=self._poll_loop, daemon=True)
             self._thread.start()
+        if self.config.streaming and self._stream_thread is None:
+            self._start_streaming()
+
+    def _start_streaming(self) -> None:
+        from . import __version__
+
+        url = self.config.url.rstrip("/") + self.config.stream_path
+        headers = {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "User-Agent": f"feat-sdk-python/{__version__}",
+            "Accept": "text/event-stream",
+            "Cache-Control": "no-cache",
+        }
+        self._stream_worker = StreamWorker(
+            transport=self._stream_transport,
+            url=url,
+            headers=headers,
+            on_datafile=self._adopt_from_stream,
+            stop_event=self._stop,
+        )
+        self._stream_thread = threading.Thread(
+            target=self._stream_worker.run, daemon=True, name="feat-stream"
+        )
+        self._stream_thread.start()
 
     def close(self) -> None:
         self._stop.set()
+        if self._stream_worker is not None:
+            self._stream_worker.stop()
 
     def refresh(self) -> bool:
         """Fetch once. Returns True if the datafile changed."""
@@ -207,11 +291,37 @@ class Client:
             raise RuntimeError("datafile exceeds maximum allowed size")
         data = json.loads(body.decode("utf-8"))
         new_etag = response_headers.get("ETag") or response_headers.get("etag")
+        return self._apply_datafile(from_json(data), etag=new_etag)
+
+    def _apply_datafile(self, df: Datafile, etag: str | None = None) -> bool:
+        """Adopt `df` only if its version is strictly newer than the current.
+
+        Lock-guarded and version-ordered so concurrent poll + stream updates
+        never replace a newer datafile with an older one. `etag` (when given,
+        i.e. from a poll response or a pushed datafile) is recorded only when
+        the datafile is adopted, so an out-of-order or older frame cannot
+        regress the etag and provoke a stale conditional request. Returns True
+        if the datafile was adopted.
+        """
         with self._lock:
-            self._datafile = from_json(data)
-            if new_etag:
-                self._etag = new_etag
-        return True
+            current = self._datafile
+            adopt = current is None or df.version > current.version
+            if adopt:
+                self._datafile = df
+                if etag:
+                    self._etag = etag
+            return adopt
+
+    def _adopt_from_stream(self, data: dict[str, Any]) -> None:
+        """Apply a datafile pushed over the SSE stream (version-ordered)."""
+        try:
+            df = from_json(data)
+        except (KeyError, TypeError, ValueError):
+            # Malformed payload: keep the current datafile.
+            return
+        # Carry the pushed datafile's etag so the next conditional poll sends a
+        # current If-None-Match and gets a 304 instead of a full re-download.
+        self._apply_datafile(df, etag=df.etag)
 
     # http.client doesn't iterate getaddrinfo results on connect failure,
     # so a host with one unreachable IP wedges every request until the
@@ -301,3 +411,49 @@ class Client:
             return status, response_headers, body
         finally:
             conn.close()
+
+    # Default SSE transport: open a streaming GET against the stream endpoint.
+    # Unlike _do_request this keeps the connection open and hands back a
+    # line-yielding wrapper instead of reading the whole body.
+    def _open_sse_stream(self, url: str, headers: Mapping[str, str]) -> SSEStream:
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname
+        if host is None:
+            raise RuntimeError(f"url missing host: {url}")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        request_headers = dict(headers)
+        addresses: list[str | None] = list(self._resolve_addresses(host, port))
+        if not addresses:
+            addresses = [None]
+        last_error: BaseException | None = None
+        for ipaddr in addresses:
+            conn: http.client.HTTPConnection
+            if parsed.scheme == "https":
+                conn = _IPHTTPSConnection(
+                    host,
+                    port=port,
+                    ipaddr=ipaddr,
+                    context=ssl.create_default_context(),
+                    read_timeout=_STREAM_READ_TIMEOUT_SECONDS,
+                )
+            else:
+                conn = _IPHTTPConnection(
+                    host,
+                    port=port,
+                    ipaddr=ipaddr,
+                    read_timeout=_STREAM_READ_TIMEOUT_SECONDS,
+                )
+            try:
+                conn.request("GET", path, headers=request_headers)
+                resp = conn.getresponse()
+                return _HttpClientSSEStream(conn, resp)
+            except _RETRYABLE_CONNECT_ERRORS as e:
+                last_error = e
+                conn.close()
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("feat: could not open datafile stream")
