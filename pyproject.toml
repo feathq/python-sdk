@@ -1,6 +1,6 @@
 [project]
 name = "feat-sdk"
-version = "0.2.0"
+version = "0.3.0"
 description = "feat feature-flag SDK for Python (server-side, local evaluation)"
 readme = "README.md"
 requires-python = ">=3.10"

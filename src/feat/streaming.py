@@ -8,8 +8,22 @@ pushes a frame::
     id: <datafile version number>
     data: <full datafile JSON>
 
+It may also push an incremental delta instead of a full datafile::
+
+    event: patch
+    id: <to version number>
+    data: { "from": <number>, "to": <number>, "etag": <string>,
+            "generatedAt": <string>, "flags": { ... }, "removedFlags": [ ... ],
+            "segments": { ... }, "removedSegments": [ ... ] }
+
+A ``patch`` carries only the flags/segments that changed (under ``flags`` /
+``segments``) and the keys that were removed (under ``removedFlags`` /
+``removedSegments``). It applies only when the receiver's current datafile is
+at version ``from``; otherwise it is ignored and a reconnect re-seeds a full
+``put``.
+
 Lines beginning with ``:`` are heartbeat comments and are ignored. The pushed
-``data`` is the same datafile JSON served by ``GET /sdk/v1/datafile``.
+``put`` ``data`` is the same datafile JSON served by ``GET /sdk/v1/datafile``.
 
 This module is transport-agnostic: the worker is handed a callable that opens a
 stream and returns an :class:`SSEStream`. The default transport (stdlib
@@ -115,10 +129,11 @@ class StreamWorker:
     """Holds an SSE connection and applies pushed datafiles.
 
     Runs a reconnect loop: open the stream, dispatch ``put`` events to the
-    ``on_datafile`` callback, and on any close/error wait with exponential
-    backoff before reconnecting. ``stop_event`` (shared with the owning client)
-    halts the loop; :meth:`stop` also tears down the in-flight connection so a
-    blocking read unblocks promptly on shutdown.
+    ``on_datafile`` callback and ``patch`` events to the ``on_patch`` callback,
+    and on any close/error wait with exponential backoff before reconnecting.
+    ``stop_event`` (shared with the owning client) halts the loop; :meth:`stop`
+    also tears down the in-flight connection so a blocking read unblocks
+    promptly on shutdown.
     """
 
     def __init__(
@@ -129,6 +144,7 @@ class StreamWorker:
         headers: Mapping[str, str],
         on_datafile: Callable[[dict[str, Any]], None],
         stop_event: threading.Event,
+        on_patch: Callable[[dict[str, Any]], None] | None = None,
         initial_backoff_seconds: float = _INITIAL_BACKOFF_SECONDS,
         max_backoff_seconds: float = _MAX_BACKOFF_SECONDS,
         backoff_jitter: float = _BACKOFF_JITTER,
@@ -138,6 +154,7 @@ class StreamWorker:
         self._url = url
         self._headers = dict(headers)
         self._on_datafile = on_datafile
+        self._on_patch = on_patch
         self._stop = stop_event
         self._initial_backoff = initial_backoff_seconds
         self._max_backoff = max_backoff_seconds
@@ -216,15 +233,20 @@ class StreamWorker:
             self.connected.set()
             connected_at = time.monotonic()
             puts = 0
+            patches = 0
             for event in parse_sse(stream.iter_lines()):
                 if self._stop.is_set():
                     break
                 if event.event == "put":
                     puts += 1
                     self._handle_put(event)
+                elif event.event == "patch":
+                    patches += 1
+                    self._handle_patch(event)
             uptime = time.monotonic() - connected_at
-            # More than one put means a real change arrived beyond the seed.
-            return uptime >= self._min_uptime or puts > 1
+            # A second put or any patch means a real change arrived beyond the
+            # initial seed, so the connection was productive.
+            return uptime >= self._min_uptime or puts > 1 or patches > 0
         finally:
             with self._stream_lock:
                 self._stream = None
@@ -242,3 +264,15 @@ class StreamWorker:
         if not isinstance(data, dict):
             return
         self._on_datafile(data)
+
+    def _handle_patch(self, event: SSEEvent) -> None:
+        if self._on_patch is None:
+            return
+        try:
+            data = json.loads(event.data)
+        except (ValueError, TypeError):
+            # Malformed frame: ignore and keep the connection.
+            return
+        if not isinstance(data, dict):
+            return
+        self._on_patch(data)

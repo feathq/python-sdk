@@ -7,10 +7,10 @@ import ssl
 import threading
 import urllib.parse
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
-from .datafile import Datafile, from_json
+from .datafile import Datafile, flag_from_json, from_json, segment_from_json
 from .eval import EvaluationResult, Reason, evaluate
 from .streaming import SSEStream, SSETransport, StreamWorker
 from .types import EvalContext
@@ -202,6 +202,7 @@ class Client:
             url=url,
             headers=headers,
             on_datafile=self._adopt_from_stream,
+            on_patch=self._apply_patch_from_stream,
             stop_event=self._stop,
         )
         self._stream_thread = threading.Thread(
@@ -304,13 +305,23 @@ class Client:
         if the datafile was adopted.
         """
         with self._lock:
-            current = self._datafile
-            adopt = current is None or df.version > current.version
-            if adopt:
-                self._datafile = df
-                if etag:
-                    self._etag = etag
-            return adopt
+            return self._adopt_locked(df, etag)
+
+    def _adopt_locked(self, df: Datafile, etag: str | None) -> bool:
+        """Version-guarded adopt. Caller must already hold ``self._lock``.
+
+        Adopts ``df`` only if its version is strictly newer than the current
+        datafile, recording ``etag`` (when given) in the same branch so an
+        out-of-order or older frame cannot regress the etag. Returns True if the
+        datafile was adopted.
+        """
+        current = self._datafile
+        adopt = current is None or df.version > current.version
+        if adopt:
+            self._datafile = df
+            if etag:
+                self._etag = etag
+        return adopt
 
     def _adopt_from_stream(self, data: dict[str, Any]) -> None:
         """Apply a datafile pushed over the SSE stream (version-ordered)."""
@@ -322,6 +333,86 @@ class Client:
         # Carry the pushed datafile's etag so the next conditional poll sends a
         # current If-None-Match and gets a 304 instead of a full re-download.
         self._apply_datafile(df, etag=df.etag)
+
+    def _apply_patch_from_stream(self, patch: dict[str, Any]) -> None:
+        """Apply an incremental ``patch`` delta pushed over the SSE stream.
+
+        Version-gated: the patch applies only when its ``from`` matches the
+        current in-memory datafile version. The merge (add/replace the flags and
+        segments under ``flags`` / ``segments``, drop the keys under
+        ``removedFlags`` / ``removedSegments``, then advance ``version``,
+        ``etag`` and ``generatedAt``) happens atomically under the same lock the
+        put/poll path uses and is stored through the version-guarded adopt, so a
+        subsequent evaluation reflects the change with no HTTP refetch. On any
+        version gap or malformed payload the patch is ignored; the safety-net
+        poll and a stream reconnect (which re-seeds a full ``put``) keep the
+        client correct.
+        """
+        try:
+            from_version = patch["from"]
+            to_version = patch["to"]
+        except (KeyError, TypeError):
+            return
+        # bool is an int subclass; a JSON true/false here is malformed.
+        if (
+            not isinstance(from_version, int)
+            or isinstance(from_version, bool)
+            or not isinstance(to_version, int)
+            or isinstance(to_version, bool)
+        ):
+            return
+        # A patch must move strictly forward. A degenerate frame (to == from,
+        # which the version-guarded adopt would silently drop) or a backward
+        # frame (to < from) carries nothing to apply, so drop it intentionally.
+        if to_version <= from_version:
+            return
+
+        removed_flags = patch.get("removedFlags") or []
+        removed_segments = patch.get("removedSegments") or []
+        if not isinstance(removed_flags, list) or not isinstance(removed_segments, list):
+            return
+        try:
+            changed_flags = {
+                k: flag_from_json(v) for k, v in (patch.get("flags") or {}).items()
+            }
+            changed_segments = {
+                k: segment_from_json(v) for k, v in (patch.get("segments") or {}).items()
+            }
+        except (KeyError, TypeError, ValueError, AttributeError):
+            # Malformed flag/segment object: drop the whole patch.
+            return
+
+        etag = patch.get("etag")
+        generated_at = patch.get("generatedAt")
+
+        with self._lock:
+            current = self._datafile
+            if current is None or current.version != from_version:
+                # Version gap (or not yet seeded): ignore. A reconnect re-seeds a
+                # full put and the safety-net poll backstops correctness.
+                return
+            flags = dict(current.flags)
+            flags.update(changed_flags)
+            for key in removed_flags:
+                flags.pop(key, None)
+            segments = dict(current.segments)
+            segments.update(changed_segments)
+            for key in removed_segments:
+                segments.pop(key, None)
+            merged = replace(
+                current,
+                version=to_version,
+                etag=etag if isinstance(etag, str) else current.etag,
+                generatedAt=generated_at
+                if isinstance(generated_at, str)
+                else current.generatedAt,
+                flags=flags,
+                segments=segments,
+            )
+            # to > from == current.version, so the version-guarded adopt takes it
+            # and records the fresh etag (keeping the conditional poll's
+            # If-None-Match current so the safety poll 304s).
+            self._adopt_locked(merged, etag if isinstance(etag, str) else None)
 
     # http.client doesn't iterate getaddrinfo results on connect failure,
     # so a host with one unreachable IP wedges every request until the

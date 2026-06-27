@@ -118,6 +118,16 @@ def from_json(data: dict[str, Any]) -> Datafile:
     )
 
 
+def flag_from_json(d: dict[str, Any]) -> FlagSpec:
+    """Parse a single wire-format flag object. Used by full datafile and patch parsing."""
+    return _flag(d)
+
+
+def segment_from_json(d: dict[str, Any]) -> SegmentSpec:
+    """Parse a single wire-format segment object. Used by full datafile and patch parsing."""
+    return _segment(d)
+
+
 def _flag(d: dict[str, Any]) -> FlagSpec:
     return FlagSpec(
         id=d["id"],
