@@ -509,6 +509,263 @@ def test_stream_etag_used_by_subsequent_poll_gets_304():
     assert captured.get("If-None-Match") == "etag-2"
 
 
+# --- incremental patch ------------------------------------------------------
+
+
+def flag_obj(key: str, *, flag_id: str, default_variation_id: str) -> dict[str, Any]:
+    """A full wire-format flag object, as carried inside a patch `flags` map."""
+    return {
+        "id": flag_id,
+        "key": key,
+        "valueType": "boolean",
+        "salt": "abcdef0123456789",
+        "archived": False,
+        "isEnabled": True,
+        "offVariationId": FALSE_VAR["id"],
+        "defaultVariationId": default_variation_id,
+        "defaultRollout": None,
+        "defaultBucketingContextKindKey": None,
+        "variations": [TRUE_VAR, FALSE_VAR],
+        "targets": [],
+        "rules": [],
+    }
+
+
+def segment_obj(key: str) -> dict[str, Any]:
+    return {"key": key, "rules": []}
+
+
+def patch_frame(
+    from_version: int,
+    to_version: int,
+    *,
+    flags: dict[str, Any] | None = None,
+    removed_flags: list[str] | None = None,
+    segments: dict[str, Any] | None = None,
+    removed_segments: list[str] | None = None,
+    etag: str | None = None,
+) -> list[str]:
+    """SSE lines for one `patch` carrying a delta from `from_version` to `to_version`."""
+    payload = json.dumps(
+        {
+            "from": from_version,
+            "to": to_version,
+            "etag": etag if etag is not None else f"etag-{to_version}",
+            "generatedAt": f"2026-06-27T00:00:0{to_version}Z",
+            "flags": flags or {},
+            "removedFlags": removed_flags or [],
+            "segments": segments or {},
+            "removedSegments": removed_segments or [],
+        }
+    )
+    return ["event: patch", f"id: {to_version}", f"data: {payload}", ""]
+
+
+def test_patch_matching_version_flips_a_later_evaluation():
+    # Seed v1 where checkout is OFF, then patch from=1 to=2 flipping it ON.
+    transport = StubTransport(
+        [
+            StubStream(
+                patch_frame(
+                    1,
+                    2,
+                    flags={
+                        "checkout": flag_obj(
+                            "checkout", flag_id="flag-1", default_variation_id=TRUE_VAR["id"]
+                        )
+                    },
+                )
+            )
+        ]
+    )
+    client = make_client(transport)
+    client._apply_datafile(_from(datafile_json(1, default_variation_id=FALSE_VAR["id"])))
+    assert client.get_boolean_value("checkout", True, user_ctx("u1")) is False
+
+    _worker(client, transport)._stream_once()
+
+    assert client._datafile.version == 2
+    assert client._datafile.generatedAt == "2026-06-27T00:00:02Z"
+    assert client.get_boolean_value("checkout", False, user_ctx("u1")) is True
+
+
+def test_patch_removes_a_flag():
+    seed = datafile_json(1)
+    seed["flags"]["legacy"] = flag_obj(
+        "legacy", flag_id="flag-legacy", default_variation_id=TRUE_VAR["id"]
+    )
+    transport = StubTransport([StubStream(patch_frame(1, 2, removed_flags=["legacy"]))])
+    client = make_client(transport)
+    client._apply_datafile(_from(seed))
+    assert "legacy" in client._datafile.flags
+
+    _worker(client, transport)._stream_once()
+
+    assert client._datafile.version == 2
+    assert "legacy" not in client._datafile.flags
+    assert "checkout" in client._datafile.flags  # untouched flag survives
+
+
+def test_patch_merges_and_removes_segments():
+    seed = datafile_json(1)
+    seed["segments"] = {"beta-users": segment_obj("beta-users")}
+    transport = StubTransport(
+        [
+            StubStream(
+                patch_frame(
+                    1,
+                    2,
+                    segments={"power-users": segment_obj("power-users")},
+                    removed_segments=["beta-users"],
+                )
+            )
+        ]
+    )
+    client = make_client(transport)
+    client._apply_datafile(_from(seed))
+
+    _worker(client, transport)._stream_once()
+
+    assert client._datafile.version == 2
+    assert "power-users" in client._datafile.segments
+    assert "beta-users" not in client._datafile.segments
+
+
+def test_patch_advances_version_and_etag_so_a_follow_up_poll_304s():
+    transport = StubTransport([StubStream(patch_frame(1, 2))])
+    client = make_client(transport)
+    client._apply_datafile(_from(datafile_json(1)), etag="etag-1")
+
+    _worker(client, transport)._stream_once()
+    assert client._datafile.version == 2
+    assert client._etag == "etag-2"  # advanced by the patch
+
+    captured: dict[str, str] = {}
+
+    def fake_request(host, port, scheme, path, headers):
+        captured.update(headers)
+        return 304, {}, b""
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    changed = client.refresh()
+
+    assert changed is False
+    assert captured.get("If-None-Match") == "etag-2"
+
+
+def test_patch_ignored_on_version_mismatch():
+    # Current is v5; a patch claiming from=1 does not apply (gap).
+    transport = StubTransport(
+        [
+            StubStream(
+                patch_frame(
+                    1,
+                    2,
+                    flags={
+                        "checkout": flag_obj(
+                            "checkout", flag_id="flag-1", default_variation_id=TRUE_VAR["id"]
+                        )
+                    },
+                )
+            )
+        ]
+    )
+    client = make_client(transport)
+    client._apply_datafile(_from(datafile_json(5, default_variation_id=FALSE_VAR["id"])), etag="etag-5")
+
+    _worker(client, transport)._stream_once()
+
+    assert client._datafile.version == 5  # unchanged
+    assert client._etag == "etag-5"  # etag not regressed/advanced
+    assert client.get_boolean_value("checkout", True, user_ctx("u1")) is False
+
+
+def test_patch_non_dict_payload_is_ignored():
+    transport = StubTransport([StubStream(["event: patch", "data: 5", ""])])
+    client = make_client(transport)
+    client._apply_datafile(_from(datafile_json(1)))
+
+    _worker(client, transport)._stream_once()  # must not raise
+
+    assert client._datafile.version == 1
+
+
+def test_patch_malformed_payload_is_ignored():
+    # Missing from/to, bad JSON, and a malformed flag object each leave v1 intact.
+    bad_json = ["event: patch", "data: {not json", ""]
+    missing_keys = ["event: patch", 'data: {"to": 2}', ""]
+    bad_flag = json.dumps(
+        {
+            "from": 1,
+            "to": 2,
+            "etag": "etag-2",
+            "generatedAt": "2026-06-27T00:00:02Z",
+            "flags": {"checkout": {"id": "flag-1"}},  # missing required keys
+            "removedFlags": [],
+            "segments": {},
+            "removedSegments": [],
+        }
+    )
+    for lines in (bad_json, missing_keys, ["event: patch", f"data: {bad_flag}", ""]):
+        transport = StubTransport([StubStream(lines)])
+        client = make_client(transport)
+        client._apply_datafile(_from(datafile_json(1, default_variation_id=FALSE_VAR["id"])))
+
+        _worker(client, transport)._stream_once()  # must not raise
+
+        assert client._datafile.version == 1
+        assert client.get_boolean_value("checkout", True, user_ctx("u1")) is False
+
+
+def test_chained_patches_apply_in_order():
+    # Two patches in one connection: 1->2 flips checkout ON, 2->3 adds a flag.
+    lines = patch_frame(
+        1,
+        2,
+        flags={
+            "checkout": flag_obj(
+                "checkout", flag_id="flag-1", default_variation_id=TRUE_VAR["id"]
+            )
+        },
+    ) + patch_frame(
+        2,
+        3,
+        flags={"beta": flag_obj("beta", flag_id="flag-beta", default_variation_id=TRUE_VAR["id"])},
+    )
+    transport = StubTransport([StubStream(lines)])
+    client = make_client(transport)
+    client._apply_datafile(_from(datafile_json(1, default_variation_id=FALSE_VAR["id"])))
+
+    _worker(client, transport)._stream_once()
+
+    assert client._datafile.version == 3
+    assert client._etag == "etag-3"
+    assert "beta" in client._datafile.flags
+    assert client.get_boolean_value("checkout", False, user_ctx("u1")) is True
+
+
+def test_put_then_patch_on_one_connection():
+    # A seed `put` at v2 followed by a `patch` 2->3 both land in order.
+    lines = put_frame(2, default_variation_id=FALSE_VAR["id"]) + patch_frame(
+        2,
+        3,
+        flags={
+            "checkout": flag_obj(
+                "checkout", flag_id="flag-1", default_variation_id=TRUE_VAR["id"]
+            )
+        },
+    )
+    transport = StubTransport([StubStream(lines)])
+    client = make_client(transport)
+    client._apply_datafile(_from(datafile_json(1)))
+
+    _worker(client, transport)._stream_once()
+
+    assert client._datafile.version == 3
+    assert client.get_boolean_value("checkout", False, user_ctx("u1")) is True
+
+
 # --- helpers ---------------------------------------------------------------
 
 
@@ -524,6 +781,7 @@ def _worker(client: Client, transport, **kwargs: Any) -> StreamWorker:
         url="https://localhost/sdk/v1/datafile/stream",
         headers={"Authorization": "Bearer feat_sdk_test"},
         on_datafile=client._adopt_from_stream,
+        on_patch=client._apply_patch_from_stream,
         stop_event=client._stop,
         **kwargs,
     )
