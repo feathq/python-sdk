@@ -361,6 +361,11 @@ class Client:
             or isinstance(to_version, bool)
         ):
             return
+        # A patch must move strictly forward. A degenerate frame (to == from,
+        # which the version-guarded adopt would silently drop) or a backward
+        # frame (to < from) carries nothing to apply, so drop it intentionally.
+        if to_version <= from_version:
+            return
 
         removed_flags = patch.get("removedFlags") or []
         removed_segments = patch.get("removedSegments") or []

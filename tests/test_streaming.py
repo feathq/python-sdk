@@ -681,6 +681,226 @@ def test_patch_ignored_on_version_mismatch():
     assert client.get_boolean_value("checkout", True, user_ctx("u1")) is False
 
 
+def test_patch_ignored_when_current_is_behind_the_from_version():
+    # Current is v1; a patch claiming from=3 is ahead of us (a true gap below
+    # the patch). It must not apply, and the version must stay at v1 so the
+    # safety-net poll / reconnect can recover the missed versions.
+    transport = StubTransport(
+        [
+            StubStream(
+                patch_frame(
+                    3,
+                    4,
+                    flags={
+                        "checkout": flag_obj(
+                            "checkout", flag_id="flag-1", default_variation_id=TRUE_VAR["id"]
+                        )
+                    },
+                )
+            )
+        ]
+    )
+    client = make_client(transport)
+    client._apply_datafile(_from(datafile_json(1, default_variation_id=FALSE_VAR["id"])), etag="etag-1")
+
+    _worker(client, transport)._stream_once()
+
+    assert client._datafile.version == 1  # unchanged; we were behind the patch
+    assert client._etag == "etag-1"  # etag not advanced
+    assert client.get_boolean_value("checkout", True, user_ctx("u1")) is False
+
+
+def test_patch_with_to_not_greater_than_from_is_dropped():
+    # A degenerate (to == from) or backward (to < from) patch carries nothing to
+    # apply forward and must be dropped, leaving the datafile untouched.
+    for to_version in (2, 1):
+        transport = StubTransport(
+            [
+                StubStream(
+                    patch_frame(
+                        2,
+                        to_version,
+                        flags={
+                            "checkout": flag_obj(
+                                "checkout", flag_id="flag-1", default_variation_id=TRUE_VAR["id"]
+                            )
+                        },
+                    )
+                )
+            ]
+        )
+        client = make_client(transport)
+        client._apply_datafile(
+            _from(datafile_json(2, default_variation_id=FALSE_VAR["id"])), etag="etag-2"
+        )
+
+        _worker(client, transport)._stream_once()
+
+        assert client._datafile.version == 2  # unchanged
+        assert client._etag == "etag-2"
+        assert client.get_boolean_value("checkout", True, user_ctx("u1")) is False
+
+
+def test_patch_before_any_datafile_is_seeded_is_ignored():
+    # No `put`/poll has seeded a datafile yet; a patch has nothing to merge onto.
+    transport = StubTransport(
+        [
+            StubStream(
+                patch_frame(
+                    1,
+                    2,
+                    flags={
+                        "checkout": flag_obj(
+                            "checkout", flag_id="flag-1", default_variation_id=TRUE_VAR["id"]
+                        )
+                    },
+                )
+            )
+        ]
+    )
+    client = make_client(transport)
+    assert client._datafile is None
+
+    _worker(client, transport)._stream_once()  # must not raise
+
+    assert client._datafile is None
+
+
+def test_patch_applied_twice_is_idempotent():
+    # The same from->to patch arriving twice (two frames on one connection)
+    # applies once; the second sees current.version != from and is a no-op.
+    lines = patch_frame(
+        1,
+        2,
+        flags={
+            "checkout": flag_obj(
+                "checkout", flag_id="flag-1", default_variation_id=TRUE_VAR["id"]
+            )
+        },
+    ) * 2
+    transport = StubTransport([StubStream(lines)])
+    client = make_client(transport)
+    client._apply_datafile(_from(datafile_json(1, default_variation_id=FALSE_VAR["id"])))
+
+    _worker(client, transport)._stream_once()
+
+    assert client._datafile.version == 2  # advanced once, not twice
+    assert client._datafile.generatedAt == "2026-06-27T00:00:02Z"
+    assert client.get_boolean_value("checkout", False, user_ctx("u1")) is True
+
+
+def test_patch_with_bool_versions_is_rejected():
+    # JSON true/false deserializes to Python bool (an int subclass); the
+    # bool-subclass guard must reject it rather than treat it as version 0/1.
+    payload = json.dumps(
+        {
+            "from": True,
+            "to": False,
+            "etag": "etag-2",
+            "generatedAt": "2026-06-27T00:00:02Z",
+            "flags": {},
+            "removedFlags": [],
+            "segments": {},
+            "removedSegments": [],
+        }
+    )
+    transport = StubTransport([StubStream(["event: patch", f"data: {payload}", ""])])
+    client = make_client(transport)
+    client._apply_datafile(_from(datafile_json(1)), etag="etag-1")
+
+    _worker(client, transport)._stream_once()  # must not raise
+
+    assert client._datafile.version == 1
+    assert client._etag == "etag-1"
+
+
+def test_patch_with_non_list_removed_keys_is_dropped():
+    # `removedFlags` / `removedSegments` must be lists; a non-list drops the patch.
+    for field, value in (("removedFlags", {"checkout": True}), ("removedSegments", "beta")):
+        body = {
+            "from": 1,
+            "to": 2,
+            "etag": "etag-2",
+            "generatedAt": "2026-06-27T00:00:02Z",
+            "flags": {},
+            "removedFlags": [],
+            "segments": {},
+            "removedSegments": [],
+        }
+        body[field] = value
+        payload = json.dumps(body)
+        transport = StubTransport([StubStream(["event: patch", f"data: {payload}", ""])])
+        client = make_client(transport)
+        client._apply_datafile(_from(datafile_json(1)), etag="etag-1")
+
+        _worker(client, transport)._stream_once()  # must not raise
+
+        assert client._datafile.version == 1  # unchanged
+        assert client._etag == "etag-1"
+
+
+def test_patch_omitting_etag_and_generated_at_preserves_current_values():
+    # A patch without `etag` / `generatedAt` (or with non-string values) must
+    # keep the current values rather than regress them to None.
+    seed = datafile_json(1)
+    seed["etag"] = "etag-1"
+    seed["generatedAt"] = "2026-06-26T00:00:00Z"
+    payload = json.dumps(
+        {
+            "from": 1,
+            "to": 2,
+            # etag omitted entirely; generatedAt present but non-string.
+            "generatedAt": 12345,
+            "flags": {},
+            "removedFlags": [],
+            "segments": {},
+            "removedSegments": [],
+        }
+    )
+    transport = StubTransport([StubStream(["event: patch", f"data: {payload}", ""])])
+    client = make_client(transport)
+    client._apply_datafile(_from(seed), etag="etag-1")
+
+    _worker(client, transport)._stream_once()
+
+    assert client._datafile.version == 2  # patch still applied
+    assert client._datafile.etag == "etag-1"  # preserved, not None
+    assert client._datafile.generatedAt == "2026-06-26T00:00:00Z"  # preserved
+    assert client._etag == "etag-1"  # client etag not regressed
+
+
+def test_heartbeat_between_two_patches_applies_both_in_order():
+    # A `: ping` comment interleaved between two patch frames on one connection
+    # is ignored, and both patches still apply in order.
+    lines = (
+        patch_frame(
+            1,
+            2,
+            flags={
+                "checkout": flag_obj(
+                    "checkout", flag_id="flag-1", default_variation_id=TRUE_VAR["id"]
+                )
+            },
+        )
+        + [": ping"]
+        + patch_frame(
+            2,
+            3,
+            flags={"beta": flag_obj("beta", flag_id="flag-beta", default_variation_id=TRUE_VAR["id"])},
+        )
+    )
+    transport = StubTransport([StubStream(lines)])
+    client = make_client(transport)
+    client._apply_datafile(_from(datafile_json(1, default_variation_id=FALSE_VAR["id"])))
+
+    _worker(client, transport)._stream_once()
+
+    assert client._datafile.version == 3
+    assert client._etag == "etag-3"
+    assert "beta" in client._datafile.flags
+    assert client.get_boolean_value("checkout", False, user_ctx("u1")) is True
+
+
 def test_patch_non_dict_payload_is_ignored():
     transport = StubTransport([StubStream(["event: patch", "data: 5", ""])])
     client = make_client(transport)
